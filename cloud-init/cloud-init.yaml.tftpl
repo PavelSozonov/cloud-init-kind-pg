@@ -1,0 +1,640 @@
+#cloud-config
+package_update: true
+package_upgrade: true
+package_reboot_if_required: true
+
+# Install APT packages declaratively.
+packages:
+  - git
+  - jq
+  - curl
+  - ca-certificates
+  - docker.io
+  - postgresql
+  - postgresql-contrib
+  - gettext-base
+  - bash-completion
+  - snapd
+
+# Install snaps declaratively (kubectl + helm available system-wide).
+snap:
+  commands:
+    - [ install, kubectl, --classic ]
+    - [ install, helm, --classic ]
+
+write_files:
+  - path: /etc/bootstrap/env
+    permissions: "0600"
+    owner: root:root
+    content: |
+      SERVER_IP="${SERVER_IP}"
+      KIND_VERSION="${KIND_VERSION}"
+      API_PORT="${API_PORT}"
+      ACME_EMAIL="${ACME_EMAIL}"
+      PG_PASSWORD="${PG_PASSWORD}"
+
+  # ---------- System bootstrap ----------
+  - path: /opt/bootstrap/00-system.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      mark=/var/lib/bootstrap/complete.d/00-system
+      [[ -f "$mark" ]] && exit 0
+
+      # Docker service
+      systemctl enable --now docker
+
+      # inotify limits
+      mkdir -p /etc/sysctl.d
+      cat >/etc/sysctl.d/99-inotify.conf <<'EOF'
+      fs.inotify.max_user_instances = 8192
+      fs.inotify.max_user_watches = 1048576
+      EOF
+      sysctl --system >/dev/null || true
+
+      # Docker ulimits + log rotation
+      mkdir -p /etc/docker
+      if [ ! -f /etc/docker/daemon.json ]; then
+        cat >/etc/docker/daemon.json <<'JSON'
+      {
+        "default-ulimits": { "nofile": { "Name":"nofile", "Soft": 1048576, "Hard": 1048576 } },
+        "log-driver": "json-file",
+        "log-opts": { "max-size": "200m", "max-file": "3" }
+      }
+      JSON
+        systemctl restart docker
+      else
+        if ! grep -q '"default-ulimits"' /etc/docker/daemon.json; then
+          jq '. + {"default-ulimits":{"nofile":{"Name":"nofile","Soft":1048576,"Hard":1048576}}}' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp && mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+        fi
+        if ! grep -q '"log-driver"' /etc/docker/daemon.json; then
+          jq '. + {"log-driver":"json-file","log-opts":{"max-size":"200m","max-file":"3"}}' /etc/docker/daemon.json > /etc/docker/daemon.json.tmp && mv /etc/docker/daemon.json.tmp /etc/docker/daemon.json
+        fi
+        systemctl restart docker
+      fi
+
+      # Bash completion for kubectl/helm (system-wide)
+      kubectl completion bash >/etc/bash_completion.d/kubectl  || true
+      helm    completion bash >/etc/bash_completion.d/helm     || true
+      if ! grep -q '/usr/share/bash-completion/bash_completion' /etc/bash.bashrc; then
+        cat >>/etc/bash.bashrc <<'EOF'
+      # Enable bash completion for all users
+      if [ -f /usr/share/bash-completion/bash_completion ]; then
+        . /usr/share/bash-completion/bash_completion
+      fi
+      EOF
+      fi
+
+      # Paths needed by your workloads
+      mkdir -p /data/dev/minio /data/prod/minio
+      chmod 0755 /data /data/dev /data/dev/minio /data/prod /data/prod/minio
+
+      touch "$mark"
+
+  # ---------- Kind cluster ----------
+  - path: /opt/bootstrap/10-kind.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euxo pipefail
+      exec >>/var/log/bootstrap-10-kind.log 2>&1
+      export PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin
+      export HOME=/root
+      export KUBECONFIG=/root/.kube/config
+
+      SERVER_IP="${SERVER_IP}"
+      KIND_VERSION="${KIND_VERSION}"
+      API_PORT="${API_PORT}"
+      mark=/var/lib/bootstrap/complete.d/10-kind
+      [[ -f "$mark" ]] && exit 0
+
+      need_install=true
+      if command -v kind >/dev/null 2>&1; then
+        cur="$(kind --version 2>/dev/null | sed -E 's/^kind v?([0-9.]+).*/\1/')"
+        if [[ "$cur" == "${KIND_VERSION}" ]]; then
+          need_install=false
+        fi
+      fi
+      if $need_install; then
+        curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+        curl -fsSL -o /usr/local/bin/kind.sha256 "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64.sha256sum"
+        (cd /usr/local/bin && sha256sum -c kind.sha256)
+        chmod +x /usr/local/bin/kind
+      fi
+
+      cat >/root/kind-config.yaml <<EOF
+      kind: Cluster
+      apiVersion: kind.x-k8s.io/v1alpha4
+      name: forge
+      nodes:
+        - role: control-plane
+          image: kindest/node:v1.33.4
+          extraPortMappings:
+            - containerPort: 80
+              hostPort: 80
+              protocol: TCP
+            - containerPort: 443
+              hostPort: 443
+              protocol: TCP
+            - containerPort: 6443
+              hostPort: 6443
+              protocol: TCP
+          kubeadmConfigPatches:
+            - |
+              apiVersion: kubeadm.k8s.io/v1beta4
+              kind: ClusterConfiguration
+              apiServer:
+                certSANs:
+                  - "${SERVER_IP}"
+                extraArgs:
+                  bind-address: "0.0.0.0"
+        - role: worker
+          image: kindest/node:v1.33.4
+          extraMounts:
+            - hostPath: /data/dev/minio
+              containerPath: /data/dev/minio
+            - hostPath: /data/prod/minio
+              containerPath: /data/prod/minio
+      EOF
+
+      kind delete cluster --name forge || true
+      kind create cluster --config /root/kind-config.yaml
+
+      # Kubeconfig -> rewrite server to public IP:port
+      mkdir -p /root/.kube
+      kind get kubeconfig --name forge > /root/.kube/config
+      sed -i -E "s#^(\s*server:\s*)https://[^[:space:]]+#\1https://${SERVER_IP}:${API_PORT}#" /root/.kube/config
+
+      # Publish a shared, read-only kubeconfig for all OS Login users
+      install -d -m 0755 /etc/kubernetes
+      install -m 0444 /root/.kube/config /etc/kubernetes/kubeconfig || true
+
+      # Wait until both nodes Ready to avoid races
+      timeout 300 bash -c 'until kubectl get nodes 2>/dev/null | awk "NR>1 && / Ready /" | wc -l | grep -q "^2$"; do sleep 5; done'
+      kubectl -n kube-system rollout status deploy/coredns --timeout=5m
+
+      touch "$mark"
+
+  # ---------- ingress-nginx ----------
+  - path: /opt/bootstrap/20-ingress.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euxo pipefail
+      exec >>/var/log/bootstrap-20-ingress.log 2>&1
+      export PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin
+      export HOME=/root
+      export KUBECONFIG=/root/.kube/config
+
+      mark=/var/lib/bootstrap/complete.d/20-ingress
+      [[ -f "$mark" ]] && exit 0
+
+      echo "=== Label control-plane node ingress-ready=true ==="
+      kubectl label node forge-control-plane ingress-ready=true --overwrite
+
+      echo "=== Install ingress-nginx (Kind manifest) ==="
+      # Use the upstream Kind-specific manifest and latest stable controller that supports K8s 1.33.
+      kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.13.2/deploy/static/provider/kind/deploy.yaml
+
+      # Admission webhook creation/patch jobs must complete to populate the CA bundle used by the ValidatingWebhookConfiguration.
+      echo "=== Wait for ingress-nginx admission jobs to complete (create/patch) ==="
+      kubectl -n ingress-nginx wait --for=condition=complete job/ingress-nginx-admission-create --timeout=5m || true
+      kubectl -n ingress-nginx wait --for=condition=complete job/ingress-nginx-admission-patch  --timeout=5m || true
+
+      echo "=== Wait for ingress-nginx controller rollout ==="
+      kubectl -n ingress-nginx rollout status deploy/ingress-nginx-controller --timeout=5m
+
+      # Verify that the ValidatingWebhookConfiguration has a non-empty CA bundle. If it didn't get patched, the webhook may block Ingress creation (including cert-manager HTTP-01 challenges).
+      check_ca_bundle(){
+        kubectl get validatingwebhookconfiguration ingress-nginx-admission -o jsonpath='{.webhooks[0].clientConfig.caBundle}' 2>/dev/null || true
+      }
+      CAB="$(check_ca_bundle || true)"
+      if [ -z "${CAB}" ]; then
+        echo "=== Admission CA bundle empty; retrying patch job once ==="
+        kubectl -n ingress-nginx delete job/ingress-nginx-admission-patch --ignore-not-found=true
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.13.2/deploy/static/provider/kind/deploy.yaml
+        kubectl -n ingress-nginx wait --for=condition=complete job/ingress-nginx-admission-patch --timeout=5m || true
+        CAB="$(check_ca_bundle || true)"
+      fi
+
+      if [ -z "${CAB}" ]; then
+        echo "=== WARNING: Admission CA bundle still empty; removing validating webhook to avoid cluster blocks ==="
+        # Leaving a broken webhook can block new/updated Ingress objects incl. ACME HTTP-01. Removing reduces validation safety but restores functionality
+        kubectl delete validatingwebhookconfiguration ingress-nginx-admission || true
+      fi
+
+      touch "$mark"
+
+  # ---------- cert-manager ----------
+  - path: /opt/bootstrap/30-certmgr.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euxo pipefail
+      exec >>/var/log/bootstrap-30-certmgr.log 2>&1
+      export PATH=/usr/local/bin:/usr/bin:/bin:/snap/bin
+      export HOME=/root
+      export KUBECONFIG=/root/.kube/config
+
+      ACME_EMAIL="${ACME_EMAIL}"
+      mark=/var/lib/bootstrap/complete.d/30-certmgr
+      [[ -f "$mark" ]] && exit 0
+
+      # Install from official OCI registry and enable CRDs (recommended), pinned to latest stable v1.18.x.
+      helm upgrade --install cert-manager oci://quay.io/jetstack/charts/cert-manager \
+        --version v1.18.2 \
+        --namespace cert-manager --create-namespace \
+        --set crds.enabled=true
+
+      kubectl -n cert-manager rollout status deploy/cert-manager --timeout=5m
+      kubectl -n cert-manager rollout status deploy/cert-manager-webhook --timeout=5m
+      kubectl -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=5m
+
+      cat <<EOF | kubectl apply -f -
+      apiVersion: cert-manager.io/v1
+      kind: ClusterIssuer
+      metadata: { name: letsencrypt-staging }
+      spec:
+        acme:
+          email: ${ACME_EMAIL}
+          server: https://acme-staging-v02.api.letsencrypt.org/directory
+          privateKeySecretRef: { name: letsencrypt-staging }
+          solvers:
+            - http01:
+                ingress: { class: nginx }
+      ---
+      apiVersion: cert-manager.io/v1
+      kind: ClusterIssuer
+      metadata: { name: letsencrypt-prod }
+      spec:
+        acme:
+          email: ${ACME_EMAIL}
+          server: https://acme-v02.api.letsencrypt.org/directory
+          privateKeySecretRef: { name: letsencrypt-prod }
+          solvers:
+            - http01:
+                ingress: { class: nginx }
+      EOF
+
+      touch "$mark"
+
+  # ---------- PostgreSQL ----------
+  - path: /opt/bootstrap/40-postgres.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euxo pipefail
+      exec >>/var/log/bootstrap-40-postgres.log 2>&1
+
+      PG_PASSWORD="${PG_PASSWORD}"
+      mark=/var/lib/bootstrap/complete.d/40-postgres
+      [[ -f "$mark" ]] && exit 0
+
+      if ! locale -a | grep -iq '^ru_RU\.utf8$'; then
+        locale-gen ru_RU.UTF-8 && update-locale
+      fi
+
+      systemctl enable --now postgresql
+      PG_VERSION=$(ls /etc/postgresql | sort -Vr | head -n 1)
+      PG_HBA="/etc/postgresql/$PG_VERSION/main/pg_hba.conf"
+      CONF_D="/etc/postgresql/$PG_VERSION/main/conf.d"
+      mkdir -p "$CONF_D"
+
+      cat > "$CONF_D/99-custom.conf" <<'EOF'
+      listen_addresses = '*'
+      password_encryption = 'scram-sha-256'
+      max_connections = 200
+      superuser_reserved_connections = 5
+      EOF
+
+      grep -q 'host all all 0.0.0.0/0 scram-sha-256' "$PG_HBA" || echo 'host all all 0.0.0.0/0 scram-sha-256' >> "$PG_HBA"
+      grep -q 'host all all ::0/0 scram-sha-256'     "$PG_HBA" || echo 'host all all ::0/0 scram-sha-256'     >> "$PG_HBA"
+
+      systemctl restart postgresql
+      sudo -u postgres psql -v ON_ERROR_STOP=1 -c "ALTER USER postgres WITH PASSWORD '${PG_PASSWORD}';"
+
+      touch "$mark"
+
+  # ---------- DB restore watcher ----------
+  - path: /opt/bootstrap/50-dbrestore.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      mark=/var/lib/bootstrap/complete.d/50-dbrestore
+      [[ -f "$mark" ]] && exit 0
+
+      systemctl enable --now dbrestore-inbox.path
+      touch "$mark"
+
+  - path: /opt/bootstrap/dbrestore-scan.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+      set -Eeuo pipefail
+      INBOX=/var/backups/pg/inbox
+      ARCH=/var/backups/pg/archive
+      WORK=/var/backups/pg/staged
+      STATE=/var/lib/dbrestore/processed
+      mkdir -p "$INBOX" "$ARCH" "$WORK" "$STATE"
+      shopt -s nullglob
+      for f in "$INBOX"/*.tar.gz; do
+        sha=$(sha256sum "$f" | awk '{print $1}')
+        [[ -e "$STATE/$sha" ]] && continue
+        ts=$(date +%F_%H%M%S); dir="$WORK/$ts"; mkdir -p "$dir"
+        tar -xzf "$f" -C "$dir"
+        [[ -f "$dir/globals.sql" ]] && sudo -u postgres psql -v ON_ERROR_STOP=1 -f "$dir/globals.sql" || true
+        if [[ -f "$dir/db_meta.tsv" ]]; then
+          while IFS=$'\t' read -r DB OWNER ENC COLL CTYPE; do
+            [[ -z "$DB" ]] && continue
+            EXISTS=$(sudo -u postgres psql -Atc "select 1 from pg_database where datname='$${DB}'" || true)
+            [[ "$EXISTS" == "1" ]] && continue
+            sudo -u postgres psql <<SQL
+      CREATE DATABASE "$${DB}" WITH OWNER "$${OWNER}" ENCODING '$${ENC}' LC_COLLATE '$${COLL}' LC_CTYPE '$${CTYPE}' TEMPLATE template0;
+      SQL
+          done < "$dir/db_meta.tsv"
+        fi
+        shopt -s nullglob
+        for d in "$dir"/*.dumpdir; do
+          DB=$(basename "$${d%.dumpdir}")
+          sudo -u postgres pg_restore -d "$${DB}" -j "$(nproc)" --clean --if-exists --no-owner "$d"
+        done
+        for c in "$dir"/*.dump; do
+          DB=$(basename "$${c%.dump}")
+          created=$(sudo -u postgres psql -Atc "select 1 from pg_database where datname='$${DB}'" || true)
+          [[ "$created" == "1" ]] || sudo -u postgres createdb "$${DB}"
+          sudo -u postgres pg_restore -d "$${DB}" -j "$(nproc)" --clean --if-exists --no-owner "$c"
+        done
+        for s in "$dir"/*.sql; do
+          DB=$(basename "$${s%.sql}")
+          created=$(sudo -u postgres psql -Atc "select 1 from pg_database where datname='$${DB}'" || true)
+          [[ "$created" == "1" ]] || sudo -u postgres createdb "$${DB}"
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -d "$${DB}" -f "$s"
+        done
+        touch "$STATE/$sha"
+        mv "$f" "$ARCH/$(basename "$f")"
+      done
+
+  # ---------- Kind IP watcher ----------
+  - path: /usr/local/bin/kind-ip-watcher.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/usr/bin/env bash
+
+      # Detects control plane container ip changes, updates kubelet.conf
+      set -Eeuo pipefail
+
+      CP_NAME="$${CP_NAME:-forge-control-plane}"
+      KUBELET_CONF="/etc/kubernetes/kubelet.conf"
+      INTERVAL="$${INTERVAL:-30}"
+
+      log(){ echo "[$(date +'%F %T')] $*"; }
+
+      get_cp_ip(){
+        docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$CP_NAME" 2>/dev/null || true
+      }
+
+      get_conf_ip(){
+        docker exec "$CP_NAME" awk -F'[:/]' '/server:/ {print $5; exit}' "$KUBELET_CONF" 2>/dev/null || true
+      }
+
+      wait_for_container(){
+        until docker inspect "$CP_NAME" >/dev/null 2>&1; do
+          log "Waiting for container $CP_NAME ..."; sleep 15; done
+      }
+
+      trap 'log "Received stop signal, exiting."; exit 0' TERM INT
+
+      wait_for_container
+      log "Started kind IP watcher for $CP_NAME"
+
+      while true; do
+        cp_ip="$(get_cp_ip)"; conf_ip="$(get_conf_ip)"
+        if [[ -z "$${cp_ip}" || -z "$${conf_ip}" ]]; then sleep "$${INTERVAL}"; continue; fi
+        if [[ "$${cp_ip}" != "$${conf_ip}" ]]; then
+          log "Mismatch: $${conf_ip} -> $${cp_ip}, patching..."
+          docker exec "$CP_NAME" /bin/sh -c "sed -E -i 's@(server: https://)[0-9\\.]+(:6443)@\\1$${cp_ip}\\2@' $KUBELET_CONF"
+          docker restart "$CP_NAME" >/dev/null
+        fi
+        sleep "$${INTERVAL}"
+      done
+
+  # ---------- System-wide aliases & kubeconfig env ----------
+  - path: /etc/profile.d/10-aliases.sh
+    permissions: "0644"
+    owner: root:root
+    content: |
+      # Common aliases
+      alias ll='ls -alF'
+      alias la='ls -A'
+      alias l='ls -CF'
+      # kubectl QoL
+      alias k='kubectl'
+      alias kgp='kubectl get pods'
+      alias kgs='kubectl get svc'
+      alias kgn='kubectl get ns'
+      alias kdesc='kubectl describe'
+      alias kaf='kubectl apply -f'
+      alias kdf='kubectl delete -f'
+      kns(){ [ -n "$1" ] && kubectl config set-context --current --namespace="$1" || echo "Usage: kns <namespace>" >&2; }
+      # completions in non-login shells
+      [ -f /etc/bash_completion.d/kubectl ] && . /etc/bash_completion.d/kubectl
+      [ -f /etc/bash_completion.d/helm ]    && . /etc/bash_completion.d/helm
+
+  - path: /etc/profile.d/20-kubeconfig.sh
+    permissions: "0644"
+    owner: root:root
+    content: |
+      # Use a shared kubeconfig by default if user hasn't set one
+      if [ -z "$KUBECONFIG" ] && [ -r /etc/kubernetes/kubeconfig ]; then
+        export KUBECONFIG=/etc/kubernetes/kubeconfig
+      fi
+
+  # ---------- OS Login users: seed aliases via /etc/skel ----------
+  - path: /etc/skel/.bash_aliases
+    permissions: "0644"
+    owner: root:root
+    content: |
+      alias ll='ls -alF'
+      alias la='ls -A'
+      alias l='ls -CF'
+      alias k='kubectl'
+      alias kgp='kubectl get pods'
+      alias kgs='kubectl get svc'
+      alias kgn='kubectl get ns'
+      alias kdesc='kubectl describe'
+      alias kaf='kubectl apply -f'
+      alias kdf='kubectl delete -f'
+      kns(){ [ -n "$1" ] && kubectl config set-context --current --namespace="$1" || echo "Usage: kns <namespace>" >&2; }
+
+  # ---------- Sudoers: allow sudo docker (for OS Login admins in sudo group) ----------
+  - path: /etc/sudoers.d/90-docker
+    permissions: "0440"
+    owner: root:root
+    content: |
+      %sudo ALL=(root) NOPASSWD: /usr/bin/docker, /usr/bin/docker*
+
+  # ---------- systemd units ----------
+  - path: /etc/systemd/system/bootstrap-00-system.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Bootstrap 00: system base
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/bootstrap/00-system.sh
+      RemainAfterExit=yes
+      Restart=on-failure
+      RestartSec=10
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/bootstrap-10-kind.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Bootstrap 10: kind cluster
+      After=bootstrap-00-system.service docker.service
+      Requires=bootstrap-00-system.service docker.service
+      Wants=docker.service
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/bootstrap/10-kind.sh
+      RemainAfterExit=yes
+      Restart=on-failure
+      RestartSec=10
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/bootstrap-20-ingress.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Bootstrap 20: ingress-nginx
+      After=bootstrap-10-kind.service
+      Requires=bootstrap-10-kind.service
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/bootstrap/20-ingress.sh
+      RemainAfterExit=yes
+      Restart=on-failure
+      RestartSec=10
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/bootstrap-30-certmgr.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Bootstrap 30: cert-manager
+      After=bootstrap-20-ingress.service
+      Requires=bootstrap-20-ingress.service
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/bootstrap/30-certmgr.sh
+      RemainAfterExit=yes
+      Restart=on-failure
+      RestartSec=10
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/bootstrap-40-postgres.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Bootstrap 40: PostgreSQL configure
+      After=bootstrap-00-system.service
+      Requires=bootstrap-00-system.service
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/bootstrap/40-postgres.sh
+      RemainAfterExit=yes
+      Restart=on-failure
+      RestartSec=10
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/bootstrap-50-dbrestore.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Bootstrap 50: enable dbrestore watcher
+      After=bootstrap-40-postgres.service
+      Requires=bootstrap-40-postgres.service
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/bootstrap/50-dbrestore.sh
+      RemainAfterExit=yes
+      Restart=on-failure
+      RestartSec=10
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/dbrestore-inbox.path
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Watch for new DB backups in /var/backups/pg/inbox
+      [Path]
+      PathExistsGlob=/var/backups/pg/inbox/*.tar.gz
+      [Install]
+      WantedBy=multi-user.target
+
+  - path: /etc/systemd/system/dbrestore-inbox.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Process DB backups from inbox
+      After=postgresql.service
+      Requires=postgresql.service
+      [Service]
+      Type=oneshot
+      ExecStart=/opt/bootstrap/dbrestore-scan.sh
+
+  - path: /etc/systemd/system/kind-ip-watcher.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Kind control-plane IP watchdog: monitors and fixes kubelet API server endpoint
+      After=docker.service bootstrap-10-kind.service
+      Requires=docker.service
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/local/bin/kind-ip-watcher.sh
+      Restart=always
+      RestartSec=15
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - [ bash, -lc, "mkdir -p /var/lib/bootstrap/complete.d /var/backups/pg/inbox /var/backups/pg/archive /var/backups/pg/staged" ]
+  - [ bash, -lc, "systemctl daemon-reload" ]
+  - [ bash, -lc, "systemctl enable --now bootstrap-00-system.service" ]
+  - [ bash, -lc, "systemctl enable --now bootstrap-10-kind.service" ]
+  - [ bash, -lc, "systemctl enable --now kind-ip-watcher.service" ]
+  - [ bash, -lc, "systemctl enable --now bootstrap-20-ingress.service" ]
+  - [ bash, -lc, "systemctl enable --now bootstrap-30-certmgr.service" ]
+  - [ bash, -lc, "systemctl enable --now bootstrap-40-postgres.service" ]
+  - [ bash, -lc, "systemctl enable --now bootstrap-50-dbrestore.service" ]
