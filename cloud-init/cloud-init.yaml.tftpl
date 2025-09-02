@@ -213,7 +213,7 @@ write_files:
         kubectl get validatingwebhookconfiguration ingress-nginx-admission -o jsonpath='{.webhooks[0].clientConfig.caBundle}' 2>/dev/null || true
       }
       CAB="$(check_ca_bundle || true)"
-      if [ -z "${CAB}" ]; then
+      if [ -z "$CAB" ]; then
         echo "=== Admission CA bundle empty; retrying patch job once ==="
         kubectl -n ingress-nginx delete job/ingress-nginx-admission-patch --ignore-not-found=true
         kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.13.2/deploy/static/provider/kind/deploy.yaml
@@ -221,7 +221,7 @@ write_files:
         CAB="$(check_ca_bundle || true)"
       fi
 
-      if [ -z "${CAB}" ]; then
+      if [ -z "$CAB" ]; then
         echo "=== WARNING: Admission CA bundle still empty; removing validating webhook to avoid cluster blocks ==="
         # Leaving a broken webhook can block new/updated Ingress objects incl. ACME HTTP-01. Removing reduces validation safety but restores functionality
         kubectl delete validatingwebhookconfiguration ingress-nginx-admission || true
