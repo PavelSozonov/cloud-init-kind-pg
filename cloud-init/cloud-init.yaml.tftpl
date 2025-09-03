@@ -132,16 +132,12 @@ write_files:
 
       need_install=true
       if command -v kind >/dev/null 2>&1; then
-        cur="$(kind --version 2>/dev/null | sed -E 's/^kind v?([0-9.]+).*/\1/')"
+        cur="$({ kind --version 2>/dev/null || true; } | sed -E 's/^kind v?([0-9.]+).*/\1/')"
         if [[ "$cur" == "${KIND_VERSION}" ]]; then
           need_install=false
         fi
       fi
       if $need_install; then
-        curl -fsSL -o /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
-        curl -fsSL -o /usr/local/bin/kind.sha256 "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64.sha256sum"
-        (cd /usr/local/bin && sha256sum -c kind.sha256)
-        chmod +x /usr/local/bin/kind
         TMP="/usr/local/src/kind-${KIND_VERSION}"
         mkdir -p "$TMP"
         curl -fsSLo "$TMP/kind-linux-amd64" "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
