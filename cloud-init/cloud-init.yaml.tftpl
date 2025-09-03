@@ -518,8 +518,6 @@ write_files:
       Type=oneshot
       ExecStart=/opt/bootstrap/00-system.sh
       RemainAfterExit=yes
-      Restart=on-failure
-      RestartSec=10
       [Install]
       WantedBy=multi-user.target
 
@@ -536,8 +534,6 @@ write_files:
       Type=oneshot
       ExecStart=/opt/bootstrap/10-kind.sh
       RemainAfterExit=yes
-      Restart=on-failure
-      RestartSec=10
       [Install]
       WantedBy=multi-user.target
 
@@ -553,8 +549,6 @@ write_files:
       Type=oneshot
       ExecStart=/opt/bootstrap/20-ingress.sh
       RemainAfterExit=yes
-      Restart=on-failure
-      RestartSec=10
       [Install]
       WantedBy=multi-user.target
 
@@ -570,8 +564,6 @@ write_files:
       Type=oneshot
       ExecStart=/opt/bootstrap/30-certmgr.sh
       RemainAfterExit=yes
-      Restart=on-failure
-      RestartSec=10
       [Install]
       WantedBy=multi-user.target
 
@@ -587,8 +579,6 @@ write_files:
       Type=oneshot
       ExecStart=/opt/bootstrap/40-postgres.sh
       RemainAfterExit=yes
-      Restart=on-failure
-      RestartSec=10
       [Install]
       WantedBy=multi-user.target
 
@@ -604,8 +594,6 @@ write_files:
       Type=oneshot
       ExecStart=/opt/bootstrap/50-dbrestore.sh
       RemainAfterExit=yes
-      Restart=on-failure
-      RestartSec=10
       [Install]
       WantedBy=multi-user.target
 
