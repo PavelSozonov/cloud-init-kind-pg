@@ -14,13 +14,6 @@ packages:
   - postgresql-contrib
   - gettext-base
   - bash-completion
-  - snapd
-
-# Install snaps declaratively (kubectl + helm available system-wide).
-snap:
-  commands:
-    - [ install, kubectl, --classic ]
-    - [ install, helm, --classic ]
 
 write_files:
   - path: /etc/bootstrap/env
@@ -75,6 +68,32 @@ write_files:
         systemctl restart docker
       fi
 
+      # --- Install kubectl (no snap), checksum-verified ---
+      KUBECTL_VER="$${KUBECTL_VER:-v1.33.4}"
+
+      ARCH="$(dpkg --print-architecture)"
+      case "$ARCH" in
+        amd64) KARCH=amd64 ;;
+        arm64) KARCH=arm64 ;;
+        *)     KARCH=amd64 ;;
+      esac
+
+      TMP="/usr/local/src/kubectl-$KUBECTL_VER"
+      mkdir -p "$TMP"
+
+      curl -fsSLo "$TMP/kubectl" "https://dl.k8s.io/release/$KUBECTL_VER/bin/linux/$KARCH/kubectl"
+      curl -fsSLo "$TMP/kubectl.sha256" "https://dl.k8s.io/release/$KUBECTL_VER/bin/linux/$KARCH/kubectl.sha256"
+
+      ( cd "$TMP" && echo "$(cat kubectl.sha256)  kubectl" | sha256sum -c - )
+
+      install -m 0755 "$TMP/kubectl" /usr/local/bin/kubectl
+      rm -rf "$TMP"
+
+      # --- Install helm (no snap) ---
+      if ! command -v helm >/dev/null 2>&1; then
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      fi
+
       # Bash completion for kubectl/helm (system-wide)
       kubectl completion bash >/etc/bash_completion.d/kubectl  || true
       helm    completion bash >/etc/bash_completion.d/helm     || true
@@ -123,6 +142,13 @@ write_files:
         curl -fsSL -o /usr/local/bin/kind.sha256 "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64.sha256sum"
         (cd /usr/local/bin && sha256sum -c kind.sha256)
         chmod +x /usr/local/bin/kind
+        TMP="/usr/local/src/kind-${KIND_VERSION}"
+        mkdir -p "$TMP"
+        curl -fsSLo "$TMP/kind-linux-amd64" "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64"
+        curl -fsSLo "$TMP/kind-linux-amd64.sha256sum" "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-amd64.sha256sum"
+        ( cd "$TMP" && sha256sum -c kind-linux-amd64.sha256sum )
+        install -m 0755 "$TMP/kind-linux-amd64" /usr/local/bin/kind
+        rm -rf "$TMP"
       fi
 
       cat >/root/kind-config.yaml <<EOF
@@ -178,7 +204,7 @@ write_files:
 
       touch "$mark"
 
-  # ---------- ingress-nginx ----------
+  # ---------- ingress-nginx (Kind manifest) ----------
   - path: /opt/bootstrap/20-ingress.sh
     permissions: "0755"
     owner: root:root
